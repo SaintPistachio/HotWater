@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Hot water controls</title>
+<link rel="stylesheet" href="/admin.css">
+<script src="/admin.js" defer></script>
+</head>
+<body>
+<main>
+  <header><h1>Hot water controls</h1><button type="button" id="signout">Sign out</button></header>
+  <p id="message" class="note notice" role="status"></p>
+  <section class="card" aria-labelledby="target-heading">
+    <h2 id="target-heading">Tank settings</h2>
+    <dl><div><dt>Stored target</dt><dd id="stored">&mdash;</dd></div>
+      <div><dt>Active target</dt><dd id="active">&mdash;</dd></div>
+      <div><dt>Mode</dt><dd id="mode">&mdash;</dd></div></dl>
+    <p id="control-status" class="note">Checking the heater.</p>
+    <form id="target-form">
+      <label for="target">Set tank temperature (&deg;F)</label>
+      <div class="action"><input id="target" type="number" min="95" max="150" step="1" inputmode="numeric" required disabled>
+        <button id="temperature-submit" type="submit" disabled>Set target</button></div>
+      <p id="target-note" class="note">The mixing valve sets the hot-water outlet temperature independently.</p>
+    </form>
+    <form id="vacation-form">
+      <label for="days">Vacation days</label>
+      <div class="action"><input id="days" type="number" min="1" max="99" step="1" inputmode="numeric" value="1" required disabled>
+        <button id="vacation-submit" type="submit" disabled>Start Vacation</button></div>
+      <p id="mode-note" class="note"></p>
+      <button id="standard" type="button" disabled>Return to Standard</button>
+    </form>
+    <p id="vacation-status" class="note"></p>
+  </section>
+  <section class="card" aria-labelledby="diagnostics-heading">
+    <h2 id="diagnostics-heading">Heater diagnostics</h2>
+    <dl>
+      <div><dt>Operating state</dt><dd id="operating-state">&mdash;</dd></div>
+      <div><dt>Heating element</dt><dd id="element">&mdash;</dd></div>
+      <div><dt>Power</dt><dd id="power">&mdash;</dd></div>
+      <div><dt>Last heater reading</dt><dd id="last-reading">&mdash;</dd></div>
+      <div><dt>Active fault</dt><dd id="active-fault">&mdash;</dd></div>
+    </dl>
+    <h3>Recent heater faults</h3>
+    <ul id="fault-history"><li>Waiting for heater data.</li></ul>
+  </section>
+  <section class="card" aria-labelledby="schedule-heading">
+    <h2 id="schedule-heading">Scheduled mode changes</h2>
+    <form id="schedule-form">
+      <label for="schedule-mode">Change</label>
+      <select id="schedule-mode" disabled><option value="vacation">Start Vacation</option><option value="standard">Return to Standard</option></select>
+      <div id="schedule-duration" class="form-field">
+        <label for="schedule-days">Vacation days</label>
+        <input id="schedule-days" type="number" min="1" max="99" step="1" inputmode="numeric" value="1" required disabled>
+      </div>
+      <div class="form-field">
+        <label for="schedule-time">Start at</label>
+        <input id="schedule-time" type="datetime-local" aria-describedby="schedule-zone" required disabled>
+        <p id="schedule-zone" class="note"></p>
+      </div>
+      <button id="schedule-submit" type="submit" disabled>Schedule change</button>
+      <p class="note">The office PC must be running. Unsent changes expire three minutes after the scheduled time.</p>
+    </form>
+    <ul id="schedules"><li>Loading schedules.</li></ul>
+  </section>
+  <section class="card" aria-labelledby="presets-heading">
+    <h2 id="presets-heading">Temperature presets</h2>
+    <form id="preset-form">
+      <div class="form-field"><label for="preset-name">Preset name</label>
+        <input id="preset-name" type="text" maxlength="48" autocomplete="off" required disabled></div>
+      <div class="form-field"><label for="preset-target">Tank target (&deg;F)</label>
+        <input id="preset-target" type="number" min="95" max="150" step="1" inputmode="numeric" required disabled></div>
+      <button id="preset-submit" type="submit" disabled>Save preset</button>
+    </form>
+    <ul id="presets"><li>Loading presets.</li></ul>
+  </section>
+  <section class="card" aria-labelledby="commands-heading">
+    <h2 id="commands-heading">Recent commands</h2>
+    <ul id="commands"><li>Loading command history.</li></ul>
+  </section>
+  <a href="http://192.168.50.10:8125/">Open the family gauge</a>
+</main>
+</body>
+</html>

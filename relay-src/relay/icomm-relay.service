@@ -1,0 +1,24 @@
+# icomm_local relay -- systemd unit. Install to /etc/systemd/system/ and edit
+# the paths and ports for your host. See README.md for the full procedure,
+# including steering the water heater's traffic to this host.
+[Unit]
+Description=iCOMM local relay for A.O. Smith water heaters
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=icomm
+StateDirectory=icomm-local
+WorkingDirectory=/opt/icomm-local/relay
+Environment=LISTEN_PORT=8444
+Environment=STATE_PORT=8124
+Environment=UPSTREAM=proxy-ingress-usfield.aylanetworks.com
+# Queued writes survive restarts; the file is rewritten atomically.
+Environment=QUEUE_FILE=/var/lib/icomm-local/pending.json
+ExecStart=/opt/icomm-local/relay/.venv/bin/python icomm_hub.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

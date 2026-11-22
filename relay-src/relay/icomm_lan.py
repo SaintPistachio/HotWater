@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Ayla Local Connect ("LAN mode") server for the iCOMM relay.
+
+Phase 28 (research repo, captures INDEX) proved the whole path: when the relay
+rewrites the module's registration reply to say `lan-enabled`, the agent asks
+its cloud -- us -- for `GET /devices/<key>/lan.json` and accepts whatever key
+the answer carries. Its LAN server then arms (`local_reg.json` 202), and the
+module polls a *local* command endpoint every ~10 s while the app heartbeat
+(`PUT /local_reg.json`, notify=1) keeps the registration alive. Writes ride
+that poll; telemetry arrives as encrypted property updates. No Ayla account,
+no cloud on the control path.
+
+Protocol per Ayla's libada (client.c / lan.c, via the public Roomba source
+dump), cross-checked against deiger/AirCon's independent implementation:
+
+  key exchange   POST /local_lan/key_exchange.json
+                 {"key_exchange":{ver:1,proto:1,random_1,time_1,key_id}}
+                 -> {"random_2": <16 chars>, "time_2": <40-bit int>}
+  session keys   per direction, HMAC-SHA256(secret, HMAC-SHA256(secret, msg)+msg)
+                 with msg = random_2|random_1|time_2|time_1   (module -> app)
+                       and  random_1|random_2|time_1|time_2   (app -> module)
+                 suffix "0" = signing key, "1" = AES key, "2" = IV seed
+  framing        {"enc": b64(AES-CBC(zero-pad(json))), "sign": b64(HMAC(sign_key, json))}
+  commands       GET  /local_lan/commands.json -> encrypted {seq_no, data}
+  telemetry      POST /local_lan/property/datapoint.json -> encrypted {seq_no, data}
+
+The shared secret is generated here, not obtained from A.O. Smith. It is
+persisted next to the write queue (0600) so a relay restart does not strand
+the module on a key nobody knows: libada only fetches lan.json when it has
+*no* stored key, and never wipes it over the network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import hmac
+import json
+import logging
+import os
+import re
+import secrets
+import socket
+import string
+import time
+from pathlib import Path
+
+from aiohttp import ClientSession, ClientTimeout, web
+from Crypto.Cipher import AES
+from icomm_heater import write_private
+
+_LOGGER = logging.getLogger("icomm_lan")
+LAN_IP_RE = re.compile(r"<lan-ip>([^<]+)</lan-ip>")
+_ALNUM = string.ascii_letters + string.digits
+
+
+def _build_key(secret: bytes, msg: bytes) -> bytes:
+    """libada's client_lan_key_gen: HMAC(secret, HMAC(secret, msg) + msg)."""
+    return hmac.digest(secret, hmac.digest(secret, msg, "sha256") + msg, "sha256")
+
+
+class Direction:
+    """One direction's keys: sign, AES-CBC encrypt, and the reverse.
+
+    The CBC chain runs across messages for the whole session: each message's IV
+    is the previous message's last ciphertext block. The chain is tracked
+    explicitly, not left inside a long-lived cipher object, so that a message
+    which fails authentication cannot advance it. With a stateful cipher, one
+    garbage POST desynced every later real message (pre-publish review).
+    """
+
+    def __init__(self, secret: bytes, msg: bytes) -> None:
+        self.sign_key = _build_key(secret, msg + b"0")
+        self.crypto_key = _build_key(secret, msg + b"1")
+        self.iv = _build_key(secret, msg + b"2")[:16]
+
+    @staticmethod
+    def _pad(data: bytes) -> bytes:
+        # Zero padding, not PKCS7: that is what libada and AirCon both do.
+        return data.ljust((len(data) + 15) // 16 * 16, bytes([0]))
+
+    def encrypt_sign(self, payload: dict) -> dict:
+        text = json.dumps(payload).encode()
+        enc = AES.new(self.crypto_key, AES.MODE_CBC, self.iv).encrypt(self._pad(text))
+        self.iv = enc[-16:]
+        return {"enc": base64.b64encode(enc).decode(),
+                "sign": base64.b64encode(hmac.digest(self.sign_key, text, "sha256")).decode()}
+
+    def decrypt_validate(self, body: dict) -> dict:
+        enc = base64.b64decode(body["enc"])
+        if not enc or len(enc) % 16:
+            raise ValueError("LAN ciphertext is not whole AES blocks")
+        text = AES.new(self.crypto_key, AES.MODE_CBC, self.iv).decrypt(enc).rstrip(bytes([0]))
+        expect = base64.b64encode(hmac.digest(self.sign_key, text, "sha256")).decode()
+        if not hmac.compare_digest(expect, str(body["sign"])):
+            raise ValueError("bad LAN signature (wrong shared key?)")
+        self.iv = enc[-16:]         # advance the chain only for an authentic message
+        return json.loads(text.decode())
+
+
+class Session:
+    """Keys for one registered LAN session, from the key-exchange nonces."""
+
+    def __init__(self, secret: bytes, exchange: dict) -> None:
+        self.random_2 = "".join(secrets.choice(_ALNUM) for _ in range(16))
+        self.time_2 = time.monotonic_ns() % 2**40
+        r1, r2 = exchange["random_1"].encode(), self.random_2.encode()
+        t1 = str(exchange["time_1"]).encode()
+        t2 = str(self.time_2).encode()
+        self.app = Direction(secret, r1 + r2 + t1 + t2)   # us -> module
+        self.dev = Direction(secret, r2 + r1 + t2 + t1)   # module -> us
+
+    def response(self) -> dict:
+        return {"random_2": self.random_2, "time_2": self.time_2}
+
+
+# The periodic-reporting mask the A.O. Smith app has Ayla send when it opens
+# (captured 2026-10-24 and -25, identical): one bit per 16-bit register of
+# telemetry blocks 1-4 (73/105/26/26 bits; research phases 30 and 42). The
+# controller's live reporting lapses some hours after the last app session;
+# sending this again resumes it.
+APP_REPORTING_MASK = (
+    "0000000000000000000000000000000000000000000100000000000000000000000000000,"
+    "0000000000000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000,"
+    "10000000000000010111100000,"
+    "00010000001111110000000001")
+# Commands delivered in a row with nothing authentic back before a suspected
+# desync is logged. Every delivery asks for a reply (an ack or a datapoint).
+DESYNC_AFTER = 3
+MASK_RE = re.compile(r"^[01]{73},[01]{105},[01]{26},[01]{26}$")
+
+
+def _well_formed(update) -> bool:
+    """A LAN update as libada sends it: {"seq_no": n, "data": {...}}, with a
+    string name and a scalar value when they are present."""
+    if not isinstance(update, dict):
+        return False
+    data = update.get("data", {})
+    if not isinstance(data, dict):
+        return False
+    name, value = data.get("name"), data.get("value")
+    return ((name is None or isinstance(name, str))
+            and (value is None or isinstance(value, (str, int, float))))
+
+
+class LanServer:
+    """The relay's local doorbell: registration, command polls, telemetry."""
+
+    def __init__(self, relay, secondary: bool = False) -> None:
+        self.relay = relay
+        self.secondary = secondary
+        self.enabled = os.environ.get("LAN_MODE", "1") != "0"
+        self.port = int(os.environ.get("LAN_PORT", "8888"))
+        # MODULE_IP and LANIP_FILE describe the primary heater only (#18): a
+        # second heater is always pinned through Ayla and keeps its own key.
+        self.module_ip = None if secondary else (os.environ.get("MODULE_IP", "") or None)
+        # A configured address is the owner's word. Ayla's DSN reply carries
+        # the address Ayla last saw, which lags a network move (0.5.1: a heater
+        # moved to its own VLAN was "learned" back at its old address).
+        self.module_ip_configured = self.module_ip is not None
+        # With DNS steering the module connects from its own address, which the
+        # relay may not know yet. It is pinned once Ayla accepts that peer's
+        # authenticated config fetch (pin_module), and is then trusted over
+        # Ayla's possibly stale lan-ip, like a configured address.
+        self.module_ip_observed = False
+        self.module_dsn: str | None = None
+        self.advertise_ip = os.environ.get("RELAY_IP", "") or None
+        # The module_ip a derived advertise_ip was worked out for; None while
+        # it is RELAY_IP's (or not derived yet), which is never re-derived.
+        self._advertised_for: str | None = None
+        self.key_id = int(os.environ.get("LANIP_KEY_ID", "1"))
+        # LANIP_FILE pins the key somewhere fixed (development); otherwise it
+        # follows the heater's directory, which may be renamed once its DSN is known.
+        self._key_file_override = "" if secondary else os.environ.get("LANIP_FILE", "")
+        self.key_quarantined = 0          # unusable key files moved aside at start
+        self.key = self._load_or_create_key()
+        self.key_served_at = 0.0          # when we last answered lan.json
+        self.registered = False
+        self.session: Session | None = None
+        # True once the current session has delivered one authenticated update:
+        # proof the module holds our key, so LAN writes will not vanish.
+        self.session_verified = False
+        self.seq_no = 0
+        self.updates = 0
+        self.writes_delivered = 0
+        self.last_update = 0.0
+        self.last_heartbeat = 0.0
+        self.last_registration_result = ""
+        self.registration_failures = 0
+        # Foreign-key detection: a module holding a key we did not issue still
+        # registers (202) and starts key exchanges, but can never decrypt our
+        # replies, so it re-exchanges every heartbeat and sends no updates.
+        self.exchanges_since_update = 0
+        self.needs_key_push = False
+        # A one-shot reverse-REST read asks the MCU for current telemetry.
+        # Spontaneous superBlockDyn1 reports can be hours apart on an idle tank.
+        self.refresh_pending = False
+        self.refresh_cmd_id = 0
+        self.telemetry_requests = 0
+        self.last_refresh_request = 0.0
+        # Keep-alive reads: an idle tank can go hours without reporting, and the
+        # relay calls telemetry older than 10 min stale -- Home Assistant then
+        # marks the entity unavailable and silently drops writes, although the
+        # LAN session is fine. One read-only MCU read per interval prevents it.
+        self.refresh_interval = float(os.environ.get("LAN_REFRESH_INTERVAL", "300"))
+        self._client: ClientSession | None = None
+        self._wake_event: asyncio.Event | None = None
+        self.wakes = 0
+        # Stall detection. Live 2026-10-23 23:50: after an app (cloud) write the
+        # module kept answering our PUT heartbeats with 202 but stopped polling
+        # commands.json for 5+ minutes. A fresh POST registration (new LAN
+        # session, key exchange) resumed it within a second.
+        self.last_poll = 0.0
+        self.stall_recoveries = 0
+        self.stall_after = float(os.environ.get("LAN_STALL_AFTER", "60"))
+        self._task: asyncio.Task | None = None
+        self._runner: web.AppRunner | None = None
+        # Reporting-mask renewal (phase 42). Delivered on the next poll like a
+        # write; the module echoes the value back as a LAN update.
+        self.reporting_mask = APP_REPORTING_MASK
+        self.mask_pending = False
+        # One-shot reads of other properties (the controller firmware, which
+        # otherwise only arrives at boot). Same read-only GET as telemetry.
+        self.read_queue: list[str] = []
+        self.masks_sent = 0
+        # Suspected CBC desync (detection only). Each reply advances our side's
+        # IV chain whether or not it arrives; if one is lost, the module can't
+        # decrypt anything after it. The sign: commands delivered, nothing
+        # authentic back. Counted and logged; recovery is left to the existing
+        # stall and re-key paths.
+        self.unanswered_deliveries = 0
+        self.suspected_desyncs = 0
+        self.last_mask_sent = 0.0
+        # The last mask's property ID and when its ack came back: the relay
+        # uses the pair as its cloud-echo probe (phase 53).
+        self.mask_id: str | None = None
+        self.mask_acked = 0.0
+
+    @property
+    def key_file(self) -> Path:
+        if self._key_file_override:
+            return Path(self._key_file_override)
+        return self.relay.heater.key_file
+
+    # -- the shared secret ---------------------------------------------
+    def _load_or_create_key(self) -> str:
+        """Persist our own key; the module will not replace one it already has.
+
+        LANIP_KEY overrides for development. Otherwise reuse the file, or mint
+        a key once. Never logged, and the file is 0600.
+        """
+        if not self.enabled:
+            return ""
+        override = "" if self.secondary else os.environ.get("LANIP_KEY", "")
+        if override:
+            return override
+        path = self.key_file
+        try:
+            saved = json.loads(path.read_text())
+            key_id = int(saved.get("lanip_key_id", self.key_id))
+            key = saved["lanip_key"]
+            if not isinstance(key, str) or not key:
+                raise ValueError("no key")
+        except (FileNotFoundError, NotADirectoryError):
+            pass                                # first start: mint one below
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as err:
+            # A key file that is there but unusable (torn, hand-edited, not a
+            # JSON object) may still hold the key the module has. Overwriting
+            # it would strand the module for good, so keep it aside first.
+            if not self._quarantine_key_file(path, err):
+                return secrets.token_urlsafe(21)        # in memory only; see the log
+        else:
+            self.key_id = key_id
+            # The module's address is only announced at re-registration,
+            # which can be hours after a relay restart: remember it.
+            saved_ip = saved.get("module_ip")
+            self.module_ip = self.module_ip or (saved_ip if isinstance(saved_ip, str)
+                                                else None)
+            self.module_ip_observed = (not self.module_ip_configured
+                                       and bool(saved.get("module_ip_observed")))
+            saved_dsn = saved.get("module_dsn")
+            self.module_dsn = saved_dsn if isinstance(saved_dsn, str) else None
+            return key
+        key = secrets.token_urlsafe(21)       # 28 chars; libada caps at 32
+        try:
+            write_private(path, json.dumps(
+                {"lanip_key": key, "lanip_key_id": self.key_id}).encode())
+            _LOGGER.info("LAN mode: generated a new shared key at %s", path)
+        except OSError as err:
+            _LOGGER.warning("LAN mode: key not persisted (%s); a restart will strand "
+                            "a module that already learned it", type(err).__name__)
+        return key
+
+    def _quarantine_key_file(self, path: Path, err: Exception) -> bool:
+        """Move an unusable key file to <name>.corrupt-<time>; False if it stayed."""
+        self.key_quarantined += 1
+        earlier = len(list(path.parent.glob(f"{path.name}.corrupt-*")))
+        aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        try:
+            path.rename(aside)
+        except OSError as move_err:
+            _LOGGER.error("LAN mode: the key file is unusable (%s) and could not be "
+                          "moved aside (%s); using a temporary key and leaving the "
+                          "file alone", type(err).__name__, type(move_err).__name__)
+            return False
+        _LOGGER.error("LAN mode: the key file is unusable (%s); kept it as %s and "
+                      "minting a new key. A module holding the old key is re-keyed "
+                      "through the cloud once it is detected (%d earlier corrupt "
+                      "key file(s) beside it)", type(err).__name__, aside.name, earlier)
+        return True
+
+    def _persist(self) -> None:
+        """Rewrite the key file with the learned module address (still 0600)."""
+        if os.environ.get("LANIP_KEY") and not self.secondary:
+            return                      # dev override: nothing of ours on disk
+        try:
+            write_private(self.key_file, json.dumps({
+                "lanip_key": self.key, "lanip_key_id": self.key_id,
+                "module_ip": self.module_ip, "module_ip_observed": self.module_ip_observed,
+                "module_dsn": self.module_dsn}).encode())
+        except OSError as err:
+            _LOGGER.warning("LAN mode: could not persist module address: %s",
+                            type(err).__name__)
+
+    def lan_json(self) -> dict:
+        """Answer the agent's GET /devices/<key>/lan.json with our own key."""
+        self.key_served_at = time.time()
+        _LOGGER.warning("LAN mode: module fetched lan.json; answered with our key "
+                        "(id %s)", self.key_id)
+        return {"lanip": {"status": "enable", "lanip_key_id": self.key_id,
+                          "lanip_key": self.key, "keep_alive": 30, "auto_sync": 1}}
+
+    def learn_module_ip(self, dsn_xml: str) -> None:
+        """The registration doc carries the module's own LAN address."""
+        found = LAN_IP_RE.search(dsn_xml)
+        if found and found.group(1) != self.module_ip:
+            if self.module_ip_configured or self.module_ip_observed:
+                _LOGGER.info("LAN mode: Ayla lists the module at %s; keeping the "
+                             "configured %s", found.group(1), self.module_ip)
+                return
+            self.module_ip = found.group(1)
+            _LOGGER.info("LAN mode: module is at %s", self.module_ip)
+            self._persist()
+
+    def note_mask(self, value: str) -> None:
+        """Keep the newest mask the app sent, so a renewal repeats it exactly."""
+        if MASK_RE.match(value) and value != self.reporting_mask:
+            self.reporting_mask = value
+            _LOGGER.info("LAN mode: learned a new reporting mask from the app")
+
+    def request_mask(self) -> bool:
+        """Queue one mask delivery; False when there is no session to carry it."""
+        if not self.enabled or self.session is None:
+            return False
+        self.mask_pending = True
+        self.wake()
+        return True
+
+    def pin_module(self, peer: str, dsn: str) -> bool:
+        """Trust `peer` as the module: Ayla just accepted its config fetch.
+
+        Ayla answers /dsns/<DSN>.xml only to a requester holding that device's
+        credentials (the module's first try gets 401), and the relay forwards
+        those credentials untouched, so a 200 proves the peer is a real Ayla
+        device. Binding to one DSN stops a different Ayla device on the LAN
+        from taking over later: the first pin wins, or DEVICE_DSN if set.
+        """
+        if self.module_ip_configured:
+            return False
+        expected = self.relay.device_dsn or self.module_dsn
+        if expected and dsn.upper() != expected.upper():
+            _LOGGER.warning("LAN mode: %s fetched config for %s, not this relay's module "
+                            "%s; not trusting it", peer, dsn, expected)
+            return False
+        if peer == self.module_ip and self.module_ip_observed:
+            return True
+        self.module_ip, self.module_ip_observed, self.module_dsn = peer, True, dsn
+        self.relay.heater.adopt(dsn)
+        _LOGGER.warning("LAN mode: module %s is at %s (its own address: steered by DNS, "
+                        "not NAT)", dsn, peer)
+        self._persist()
+        return True
+
+    # -- lifecycle -------------------------------------------------------
+    async def start(self, listen: bool = True) -> None:
+        """Register with the module; listen on the LAN port unless the hub does
+        (one listener for every heater, dispatched by the caller's address)."""
+        if not self.enabled:
+            return
+        if listen:
+            # Only the module itself may call back: anyone else could reset the
+            # session with a key exchange or drain queued writes by polling.
+            peers = self.relay.peers
+            app = web.Application(
+                middlewares=[peers.middleware(peers.lan_allowed, f":{self.port}")])
+            app.router.add_post("/local_lan/key_exchange.json", self._key_exchange)
+            app.router.add_route("*", "/local_lan/commands.json", self._commands)
+            app.router.add_route("*", "/local_lan/property/datapoint.json", self._datapoint)
+            app.router.add_route("*", "/local_lan/property/datapoint/ack.json", self._datapoint)
+            self._runner = web.AppRunner(app)
+            await self._runner.setup()
+            await web.TCPSite(self._runner, "0.0.0.0", self.port).start()
+        self._client = ClientSession(timeout=ClientTimeout(total=5))
+        self._wake_event = asyncio.Event()
+        self._task = asyncio.create_task(self._registration_loop())
+        _LOGGER.info("LAN mode: listening on :%s (module %s)", self.port,
+                     self.module_ip or "learned at registration")
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+        if self._client:
+            await self._client.close()
+        if self._runner:
+            await self._runner.cleanup()
+
+    def _check_stall(self) -> None:
+        """Heartbeats accepted but no polls: drop to a fresh POST registration."""
+        if not self.registered or not self.last_poll or self.stall_after <= 0:
+            return
+        quiet = time.time() - self.last_poll
+        if quiet > self.stall_after:
+            self.stall_recoveries += 1
+            self.registered = False
+            self.last_poll = time.time()     # one re-registration per stall window
+            _LOGGER.warning("LAN mode: heartbeats accepted but no command poll for "
+                            "%.0f s; re-registering to reset the module's LAN session",
+                            quiet)
+
+    def reconnect(self) -> bool:
+        """Drop to a fresh POST registration: a new LAN session and key
+        exchange, as after a heartbeat timeout. Used for frozen telemetry."""
+        if not self.registered:
+            return False
+        self.registered = False
+        if self._wake_event is not None:
+            self._wake_event.set()
+        _LOGGER.warning("LAN mode: reconnecting (new registration and key exchange)")
+        return True
+
+    def wake(self) -> None:
+        """Send the next heartbeat now: notify=1 makes the module poll at once."""
+        if self._wake_event is not None and self.registered:
+            self.wakes += 1
+            self._wake_event.set()
+
+    async def _pause(self, delay: float) -> None:
+        if self._wake_event is None:
+            await asyncio.sleep(delay)
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._wake_event.wait(), delay)
+        self._wake_event.clear()
+
+    def status(self) -> dict:
+        now = time.time()
+        return {"enabled": self.enabled, "registered": self.registered,
+                "session": self.session is not None,
+                "session_verified": self.session_verified, "module_ip": self.module_ip,
+                "module_ip_source": ("configured" if self.module_ip_configured
+                                     else "observed" if self.module_ip_observed
+                                     else "ayla" if self.module_ip else None),
+                "port": self.port, "key_id": self.key_id,
+                "key_served": bool(self.key_served_at),
+                "last_heartbeat_age": round(now - self.last_heartbeat, 1)
+                if self.last_heartbeat else None,
+                "last_update_age": round(now - self.last_update, 1)
+                if self.last_update else None,
+                "updates": self.updates, "writes_delivered": self.writes_delivered,
+                "last_registration_result": self.last_registration_result,
+                "registration_failures": self.registration_failures,
+                "needs_key_push": self.needs_key_push,
+                "key_quarantined": self.key_quarantined,
+                "refresh_pending": self.refresh_pending,
+                "telemetry_requests": self.telemetry_requests, "wakes": self.wakes,
+                "last_poll_age": round(now - self.last_poll, 1) if self.last_poll else None,
+                "stall_recoveries": self.stall_recoveries,
+                "masks_sent": self.masks_sent,
+                "unanswered_deliveries": self.unanswered_deliveries,
+                "suspected_desyncs": self.suspected_desyncs,
+                "last_mask_sent_age": round(now - self.last_mask_sent, 1)
+                if self.last_mask_sent else None}
+
+    # -- registration: the app's heartbeat, from libada's client side -----
+    def _registration_body(self) -> dict:
+        derived_stale = (self._advertised_for is not None
+                         and self._advertised_for != self.module_ip)
+        if self.module_ip and (not self.advertise_ip or derived_stale):
+            # The address the module should call back on: ours, on its subnet.
+            # Worked out again when the module moves (a new VLAN, DHCP).
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect((self.module_ip, 80))
+                self.advertise_ip = sock.getsockname()[0]
+                self._advertised_for = self.module_ip
+            finally:
+                sock.close()
+        return {"local_reg": {"ip": self.advertise_ip, "port": self.port,
+                              "uri": "/local_lan", "notify": 1}}
+
+    async def _registration_loop(self) -> None:
+        """POST once, then PUT every ~10 s; the module polls us per heartbeat."""
+        while True:
+            delay = 10.0
+            try:
+                if not self.module_ip:
+                    delay = 5.0
+                else:
+                    self._check_stall()
+                    body = self._registration_body()
+                    method = "PUT" if self.registered else "POST"
+                    assert self._client is not None
+                    async with self._client.request(
+                            method, f"http://{self.module_ip}/local_reg.json",
+                            json=body) as response:
+                        self.last_registration_result = f"{method} {response.status}"
+                        if response.status == 202:
+                            if not self.registered:
+                                _LOGGER.warning("LAN mode: registered with the module")
+                            self.registered = True
+                            self.last_heartbeat = time.time()
+                        else:
+                            if self.registered:
+                                _LOGGER.warning("LAN mode: registration lost (%s)",
+                                                self.last_registration_result)
+                            self.registered = False
+                            # 404 = LAN not armed (needs the rewritten DSN reply),
+                            # 412 = armed but the module has no key yet.
+                            delay = 15.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 -- this loop must never die
+                # aiohttp's ServerDisconnectedError and ClientPayloadError are not
+                # OSError. Catching only (TimeoutError, OSError) let one of them
+                # end the task silently, leaving LAN mode dead until a restart.
+                self.registration_failures += 1
+                if self.registered or self.last_registration_result != type(err).__name__:
+                    _LOGGER.warning("LAN mode: heartbeat failed: %s: %s",
+                                    type(err).__name__, err)
+                self.registered = False
+                self.last_registration_result = type(err).__name__
+                delay = 15.0
+            await self._pause(delay)
+
+    # -- the module-facing endpoints --------------------------------------
+    async def _key_exchange(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            exchange = body.get("key_exchange") or {}
+            if not isinstance(exchange, dict):
+                raise ValueError
+        except (ValueError, AttributeError):
+            return web.Response(status=400)
+        if exchange.get("key_id") != self.key_id:
+            # Client-chosen: strip CR/LF so it cannot forge a log line.
+            key_id = str(exchange.get("key_id")).replace("\r", "").replace("\n", "")
+            _LOGGER.warning("LAN mode: key exchange for unknown key id %s "
+                            "(module has a key we did not issue?)", key_id)
+            return web.Response(status=404)
+        try:
+            self.session = Session(self.key.encode(), exchange)
+        except (KeyError, TypeError, AttributeError):
+            return web.Response(status=400)
+        self.session_verified = False
+        self.unanswered_deliveries = 0     # a new session starts a new chain
+        self.last_poll = time.time()       # a new session counts as contact
+        self.request_telemetry()       # do not wait hours after a relay restart
+        self.exchanges_since_update += 1
+        if self.exchanges_since_update >= 3 and not self.needs_key_push:
+            # Three exchanges, no update between them: the module's key is
+            # not ours. Ask the relay to push ours with Ayla's PUT lanip.json.
+            self.needs_key_push = True
+            _LOGGER.warning("LAN mode: module keeps re-exchanging with no updates "
+                            "-- it holds a key we did not issue; pushing ours on "
+                            "the next cloud poll")
+        else:
+            _LOGGER.info("LAN mode: key exchange accepted; session keys derived")
+        return web.json_response(self.session.response())
+
+    def request_telemetry(self) -> None:
+        """Ask for one fresh superBlockDyn1 value on a future commands poll.
+
+        libada's GET /property.json?name=... handler calls ada_prop_mgr_get(),
+        which obtains the value from the host MCU. Its response comes back to
+        our normal datapoint endpoint, encrypted like a spontaneous update.
+        """
+        self.refresh_pending = True
+
+    def _refresh_due(self) -> bool:
+        if self.refresh_interval <= 0:
+            return False
+        now = time.time()
+        newest = max(self.last_update, self.relay.last_telemetry or 0.0)
+        return (now - newest > self.refresh_interval
+                and now - self.last_refresh_request > self.refresh_interval)
+
+    async def _commands(self, request: web.Request) -> web.Response:
+        """The 10-second local poll: deliver one write or telemetry request."""
+        if self.session is None:
+            return web.Response(status=400)
+        self.last_poll = time.time()
+        self.seq_no += 1
+        data: dict = {}
+        self.relay.maybe_probe_cloud()
+        write = self.relay.take_pending_for_lan()
+        if write is not None:
+            write.command_id = "".join(secrets.choice(_ALNUM) for _ in range(8))
+            self.relay._save_queue()
+            data = {"properties": [{"property": {
+                "base_type": "string", "name": "setBlockParameter",
+                "value": write.frame, "id": write.command_id}}]}
+            self.writes_delivered += 1
+            _LOGGER.warning("LAN mode: delivering %s = %s locally",
+                            write.kind, write.value)
+        elif self.mask_pending:
+            self.mask_pending = False
+            self.masks_sent += 1
+            self.last_mask_sent = time.time()
+            self.mask_id = "".join(secrets.choice(_ALNUM) for _ in range(8))
+            data = {"properties": [{"property": {
+                "base_type": "string", "name": "periodicParameterSetting",
+                "value": self.reporting_mask, "id": self.mask_id}}]}
+            _LOGGER.warning("LAN mode: sending the reporting mask (renewal %d)",
+                            self.masks_sent)
+        elif self.refresh_pending or self._refresh_due():
+            self.refresh_pending = False       # one shot; never retry in a loop
+            self.last_refresh_request = time.time()
+            self.refresh_cmd_id += 1
+            self.telemetry_requests += 1
+            data = {"cmds": [{"cmd": {
+                "method": "GET",
+                "resource": "property.json?name=superBlockDyn1",
+                "data": "", "cmd_id": self.refresh_cmd_id,
+                "uri": "/local_lan/property/datapoint.json"}}]}
+            _LOGGER.info("LAN mode: requesting fresh telemetry (cmd %d)",
+                         self.refresh_cmd_id)
+        elif self.read_queue:      # after any refresh a write is waiting on
+            name = self.read_queue.pop(0)
+            self.refresh_cmd_id += 1
+            data = {"cmds": [{"cmd": {
+                "method": "GET", "resource": f"property.json?name={name}",
+                "data": "", "cmd_id": self.refresh_cmd_id,
+                "uri": "/local_lan/property/datapoint.json"}}]}
+            _LOGGER.info("LAN mode: reading %s (cmd %d)", name, self.refresh_cmd_id)
+        if data:
+            self._note_delivery()
+        return web.json_response(self.session.app.encrypt_sign(
+            {"seq_no": self.seq_no, "data": data}))
+
+    def _note_delivery(self) -> None:
+        self.unanswered_deliveries += 1
+        if self.unanswered_deliveries == DESYNC_AFTER:
+            self.suspected_desyncs += 1
+            _LOGGER.warning("LAN mode: %d commands delivered with no authentic update or "
+                            "ack back; the module may have lost a reply and fallen out "
+                            "of step (suspected %d time(s))", DESYNC_AFTER,
+                            self.suspected_desyncs)
+
+    async def _datapoint(self, request: web.Request) -> web.Response:
+        if self.session is None:
+            return web.Response(status=400)
+        try:
+            update = self.session.dev.decrypt_validate(await request.json())
+        except (ValueError, KeyError, TypeError) as err:
+            _LOGGER.warning("LAN mode: undecryptable update: %r", err)
+            return web.Response(status=400)
+        if not _well_formed(update):
+            # Authentic but not the shape libada sends: refused before it can
+            # count as proof of the session or reach the relay.
+            _LOGGER.warning("LAN mode: malformed update (%s); ignored", type(update).__name__)
+            return web.Response(status=400)
+        if not self.session_verified and self.relay.pending:
+            # A write queued while the session was re-keying waited for this
+            # proof; deliver it now rather than on the next ~10 s heartbeat.
+            self.session_verified = True
+            self.wake()
+        self.session_verified = True
+        self.updates += 1
+        self.last_update = time.time()
+        self.exchanges_since_update = 0
+        self.unanswered_deliveries = 0
+        self.needs_key_push = False
+        await self.relay.ingest_lan_update(update)
+        return web.Response()

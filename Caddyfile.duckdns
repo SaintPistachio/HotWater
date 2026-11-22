@@ -1,0 +1,39 @@
+https://*.{$HOTWATER_DUCKDNS_ZONE}:8443 {
+    bind 192.168.50.10
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            dns duckdns {env.HOTWATER_DUCKDNS_TOKEN} {
+                override_domain {$HOTWATER_DUCKDNS_ZONE}
+            }
+            resolvers 1.1.1.1:53 8.8.8.8:53
+        }
+    }
+
+    @admin {
+        host admin.{$HOTWATER_DUCKDNS_ZONE}
+        remote_ip 192.168.50.0/24
+    }
+    handle @admin {
+        reverse_proxy 127.0.0.1:8126 {
+            header_up X-HotWater-Proxy {$HOTWATER_PROXY_KEY}
+        }
+    }
+
+    @stats {
+        host stats.{$HOTWATER_DUCKDNS_ZONE}
+        remote_ip 192.168.50.0/24
+        method GET
+        path / /api /api/history /api/insights
+    }
+    handle @stats {
+        reverse_proxy 127.0.0.1:8125 {
+            header_up -Cookie
+            header_up -Authorization
+        }
+    }
+
+    handle {
+        respond 403
+    }
+}

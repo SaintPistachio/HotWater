@@ -1,0 +1,88 @@
+name: iCOMM Local Relay
+version: "0.8.1"
+slug: icomm_relay
+description: Transparent local relay and decoder for A.O. Smith iCOMM water heaters
+url: https://github.com/ericboehs/ha-icomm-local
+arch:
+  - aarch64
+  - amd64
+# The module is steered here by the router's DNAT rule or by DNS (dns_server),
+# so the listeners (and the DNS server on port 53) must be on the host's own
+# network, at the address the module is sent to.
+host_network: true
+init: false
+options:
+  listen_port: 8444
+  state_port: 8124
+  upstream: proxy-ingress-usfield.aylanetworks.com
+  device_dsn: ""
+  lan_mode: true
+  lan_port: 8888
+  module_ip: ""
+  relay_ip: ""
+  trusted_peers: ""
+  firmware_updates: hold
+  reporting_mask_renew: true
+  experimental_freeze_reconnect: false
+  dns_server: false
+  dns_upstream: ""
+  offline_fallback: true
+  max_heaters: 4
+schema:
+  listen_port: port
+  state_port: port
+  upstream: str
+  device_dsn: str?
+  # Local doorbell: Ayla Local Connect with a relay-minted key. No A.O. Smith
+  # account. The module polls this relay locally every ~10 s once armed.
+  lan_mode: bool
+  lan_port: port
+  # Usually learned: from the module's registration reply (NAT), or pinned once
+  # Ayla accepts its config fetch (DNS). Set it only if the relay should know
+  # it before then, or callback detection picks the wrong address. Primary
+  # heater only. A module on another subnet also needs relay_ip and the
+  # gateway rules in docs/NETWORK_ISOLATION.md.
+  module_ip: str?
+  relay_ip: str?
+  # The module-facing ports answer only the module. The cloud port (8444, and
+  # 443 with dns_server) trusts loopback, the host's default gateway (the NAT
+  # rules make the module arrive from it) and the module's own address. The
+  # Local Connect port (8888) trusts loopback and the module, not the gateway.
+  # Add comma-separated addresses here only for unusual steering; they are
+  # trusted on both. "*" disables the check.
+  trusted_peers: str?
+  # Firmware updates for the module or the heater's controller arrive through
+  # the relay. "hold" keeps them from the module and raises a Home Assistant
+  # repair to allow each one; an update could end local control. "allow"
+  # passes them as before.
+  firmware_updates: list(hold|allow)
+  # The controller's live reporting lapses hours after the last A.O. Smith app
+  # session (and after a reboot), and the data freezes. On (default): the relay
+  # re-sends the app's reporting mask over the LAN session once the data has
+  # been frozen 30 minutes (20 while it claims to be heating), and again at
+  # most that often. It has fixed a freeze in minutes, and also failed to.
+  reporting_mask_renew: bool?
+  # Experimental, off by default. After 2 mask renewals haven't unfrozen the
+  # data, reconnect the LAN session once (a new registration and key exchange,
+  # as after a heartbeat timeout), then carry on renewing. Seen to help once.
+  experimental_freeze_reconnect: bool?
+  # For routers that can't do the NAT steering: serve DNS on this host's port
+  # 53. The water heater's cloud name resolves here (the relay also listens on
+  # 443); everything else is forwarded to dns_upstream, by default the host's
+  # gateway. Then set the router's DHCP DNS server to this host's address.
+  dns_server: bool?
+  dns_upstream: str?
+  # If Ayla is unreachable when the water heater boots (a power cut during an
+  # outage), answer its config fetch from the last real reply, so local control
+  # comes back without Ayla. Does nothing while Ayla answers.
+  offline_fallback: bool?
+  # How many water heaters this relay serves. Each new heater is added when
+  # Ayla accepts its config fetch; past the limit it works through Ayla only.
+  max_heaters: int(1,8)?
+  # Debugging only, off and hidden by default. Writes the TLS session keys of
+  # the water heater's connections to /data/tls-keylog.txt (0600), so a packet
+  # capture of them can be decrypted. Anyone with the file and a capture can
+  # read that traffic: turn it off and delete the file afterwards.
+  debug_tls_keylog: bool?
+map:
+  - share:ro

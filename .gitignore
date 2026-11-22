@@ -1,0 +1,11 @@
+/.runtime/
+/.venv/
+/data/
+/state/
+/certs/
+__pycache__/
+*.py[cod]
+*.sqlite3*
+*.log
+*.key
+.env

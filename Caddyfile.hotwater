@@ -1,0 +1,26 @@
+{
+    admin off
+    persist_config off
+    skip_install_trust
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+import Caddyfile.hotwater.d/*.caddy
+
+https://192.168.50.10:8443 {
+    bind 192.168.50.10
+    tls internal
+
+    @home remote_ip 192.168.50.0/24
+    handle @home {
+        reverse_proxy 127.0.0.1:8126 {
+            header_up X-HotWater-Proxy {$HOTWATER_PROXY_KEY}
+        }
+    }
+    handle {
+        respond 403
+    }
+}

@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Hot Water</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --muted:#53606c; --card:#fff; --line:#d5dbe2;
+          --hot:#d93a2b; --warm:#e39a1c; --cold:#226ab9; --err:#b32323; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --fg:#e8ecf0; --muted:#aab5c0; --card:#1b2026; --line:#38414b;
+            --hot:#ef5a4a; --warm:#f0ad3a; --cold:#82baff; --err:#ff8787; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,"Segoe UI",sans-serif; }
+  main { max-width:650px; margin:auto; padding:20px 16px 32px; }
+  header { margin-bottom:16px; }
+  h1,h2,p,dl { margin:0; }
+  h1 { font-size:1.6rem; }
+  h2 { font-size:1.1rem; }
+  .muted,.note,dt,th { color:var(--muted); }
+  .note { font-size:.83rem; line-height:1.45; margin-top:6px; }
+  .error { color:var(--err); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:12px; }
+  .tank-charge { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-top:12px; }
+  .tank-charge dd { margin:0; font-size:1.2em; }
+  .tank { margin:4px 0 14px; height:12px; background:var(--line); overflow:hidden; border-radius:8px; }
+  .temperatures { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin:0 0 14px; }
+  .fill { height:100%; width:0; background:var(--hot); }
+  .reading { font-size:2.65rem; line-height:1.1; font-weight:750; font-variant-numeric:tabular-nums; }
+  .metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+  .metrics > div { padding:12px; border-radius:9px; background:var(--bg); }
+  dt,th { font-size:.86rem; }
+  dd { margin:4px 0 0; font-weight:650; font-variant-numeric:tabular-nums; }
+  .metrics dd { font-size:1.15rem; }
+  .metrics .note { margin-top:3px; }
+  details { margin-top:14px; }
+  summary { cursor:pointer; padding:7px 0; }
+  .details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; padding-top:8px; }
+  canvas:not([hidden]) { display:block; width:100%; height:146px; margin:8px 0 0; }
+  table { width:100%; border-collapse:collapse; margin-top:6px; text-align:right; font-variant-numeric:tabular-nums; }
+  th,td { padding:7px 0; border-bottom:1px solid var(--line); }
+  th:first-child,td:first-child { text-align:left; }
+  tr:last-child td { border-bottom:0; }
+  .replay { margin:0; padding-left:20px; }
+  .replay li { margin:5px 0; }
+  footer { padding:4px 0; text-align:center; }
+  footer a { display:inline-flex; align-items:center; min-height:44px; color:var(--cold); }
+  .hub-view { font-size:clamp(18px,2.2vw,26px); }
+  .hub-view main { max-width:none; padding:clamp(16px,2vw,28px) clamp(16px,3vw,38px); }
+  .hub-view header { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:4px 24px; }
+  .hub-view h1 { font-size:1.65em; }
+  .hub-view h2 { font-size:1em; }
+  .hub-view .card { padding:clamp(16px,2.5vw,32px); }
+  .hub-view .reading { font-size:clamp(52px,8vw,108px); line-height:1; margin-top:8px; }
+  .hub-view .note { font-size:.8em; }
+  .hub-view dt,.hub-view th { font-size:.8em; }
+  .hub-view .temperatures { column-gap:12px; }
+  .hub-view .metrics { gap:10px; }
+  .hub-view .metrics > div { padding:10px 12px; }
+  .hub-view .metrics dd { font-size:1.2em; }
+  .hub-view .metrics .note { line-height:1.3; }
+  .hub-view .metrics > div:last-child { grid-column:1 / -1; }
+  @media (min-width:800px) {
+    .hub-view .estimate-card {
+      display:grid;
+      grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);
+      gap:16px clamp(24px,4vw,48px);
+    }
+    .hub-view .estimate-card > details { grid-column:1 / -1; margin-top:0; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Hot water</h1>
+    <p id="status" class="muted">Waiting for heater data</p>
+  </header>
+  <section class="card estimate-card" aria-labelledby="estimate-heading">
+    <div>
+      <h2 id="estimate-heading">Estimated hot water left</h2>
+      <p class="reading" id="estimate">&mdash;</p>
+      <p class="note" id="estimate-note">Waiting for tank readings</p>
+      <dl class="tank-charge"><dt>Tank charge estimate</dt><dd id="percent">&mdash;</dd></dl>
+      <div class="tank" aria-hidden="true"><div class="fill" id="fill"></div></div>
+      <dl class="temperatures">
+        <div><dt>Top of tank</dt><dd id="top">&mdash;</dd></div>
+        <div><dt>Bottom of tank</dt><dd id="bottom">&mdash;</dd></div>
+        <div><dt>Active target</dt><dd id="target">&mdash;</dd></div>
+      </dl>
+    </div>
+    <dl class="metrics">
+      <div><dt>Current hot draw</dt><dd id="draw">&mdash;</dd><p class="note" id="draw-note">Waiting for recent readings</p></div>
+      <div><dt id="secondary-label">Shower time at 2 gal/min</dt><dd id="secondary">&mdash;</dd><p class="note" id="secondary-note">Waiting for usable tank readings</p></div>
+      <div><dt>Time to 100%</dt><dd id="recovery">&mdash;</dd><p class="note">Back to target, once use stops</p></div>
+      <div><dt>Recovery rate</dt><dd id="rate">&mdash;</dd><p class="note" id="rate-note">Learning from heating cycles</p></div>
+      <div><dt>Ready for another shower</dt><dd id="next-shower">&mdash;</dd><p class="note" id="next-note">Waiting for tank data</p></div>
+    </dl>
+    <details>
+      <summary>More heater readings</summary>
+      <dl class="details">
+        <div><dt>Mixing valve setting</dt><dd>120 &deg;F</dd></div>
+        <div><dt>Heater</dt><dd id="heater">&mdash;</dd></div>
+        <div><dt>App-style reading</dt><dd id="app">&mdash;</dd></div>
+      </dl>
+    </details>
+  </section>
+  <section class="card" aria-labelledby="chart-heading">
+    <h2 id="chart-heading">Tank charge over 24 hours</h2>
+    <canvas id="chart" role="img" aria-labelledby="chart-heading chart-note" hidden></canvas>
+    <p class="note" id="chart-note">Loading history</p>
+  </section>
+  <section class="card" aria-labelledby="daily-heading">
+    <h2 id="daily-heading">Daily stats</h2>
+    <p class="note" id="daily-note">Last 7 days, measured midnight to midnight. Today shows readings so far.</p>
+    <table aria-labelledby="daily-heading" aria-describedby="daily-note">
+      <thead><tr><th scope="col">Date</th><th scope="col">Low charge</th><th scope="col">Energy (kWh)</th></tr></thead>
+      <tbody id="daily-stats"><tr><td colspan="3">Loading history</td></tr></tbody>
+    </table>
+    <details><summary>Daily draw history</summary><div id="replay" class="note">Waiting for daily readings.</div></details>
+    <details><summary>Lighter and heavier draws</summary><p class="note" id="draw-groups">Waiting for six complete draws.</p></details>
+    <details><summary>Weekly recovery trend</summary><p class="note" id="trend">Waiting for observed recoveries.</p></details>
+  </section>
+  <!-- admin footer -->
+</main>
+<script>
+const missing = '\u2014';
+const get = id => document.getElementById(id);
+const set = (id, text) => {
+  const element = get(id);
+  if (element.textContent !== text) element.textContent = text;
+};
+const numeral = (value, suffix) => Number.isFinite(value) ? `${value}${suffix}` : missing;
+const degrees = value => numeral(value, ' \u00b0F');
+const minutes = value => Number.isFinite(value) ? (value === 0 ? '<1 min' : `${value} min`) : missing;
+const referenceShowerGpm = 2;
+let chartData = null;
+let insights = null;
+let reading = null;
+
+function renderReading(data) {
+  reading = data;
+  const valid = data.reading_fresh;
+  const draw = valid && data.recent_flow;
+  const recovery = valid && data.recovery;
+  const gallons = valid ? data.available_gallons : null;
+  const percent = valid ? data.percent : null;
+  const hasGallons = Number.isFinite(gallons);
+  const hasCountdown = draw && Number.isFinite(draw.minutes);
+  const reserve = numeral(hasGallons ? Math.round(gallons) : null, ' gal');
+  const reserveNote = hasGallons ? `Mixed water at ${degrees(data.comfort_f)}` : 'Waiting for usable tank readings';
+  const showerTime = hasGallons ? (gallons <= 0 ? '0 min' : minutes(Math.round(gallons / referenceShowerGpm))) : missing;
+  set('estimate-heading', hasCountdown ? 'Estimated time left' : 'Estimated hot water left');
+  set('estimate', hasCountdown ? minutes(draw.minutes) : reserve);
+  set('estimate-note', hasCountdown ? `At the current pace for ${degrees(data.comfort_f)} water` : reserveNote);
+  set('secondary-label', hasCountdown ? 'Hot water left' : `Shower time at ${referenceShowerGpm} gal/min`);
+  set('secondary', hasCountdown ? reserve : showerTime);
+  set('secondary-note', reserveNote);
+  set('draw', numeral(draw ? draw.gpm : null, ' gal/min'));
+  set('draw-note', draw ? `Inferred over ${draw.window_s} sec at ${degrees(data.comfort_f)}` : 'No sustained draw detected');
+  set('recovery', recovery && recovery.minutes === 0 ? 'At target' : minutes(recovery ? recovery.minutes : null));
+  set('rate', numeral(recovery ? recovery.gallons_per_hour : null, ' gal/hr'));
+  set('rate-note', recovery ? (recovery.learned ? 'From recent recoveries' : 'Based on rated heating power') : 'Waiting for tank data');
+  set('top', degrees(data.top_f));
+  set('bottom', degrees(data.bottom_f));
+  set('target', degrees(data.setpoint));
+  set('heater', data.heating === 'heating' ? `Heating (${numeral(data.watts, ' W')})` : data.heating || missing);
+  set('percent', numeral(percent, '%'));
+  set('app', numeral(data.app_percent, '%'));
+  const fill = get('fill');
+  fill.style.width = `${percent ?? 0}%`;
+  fill.style.backgroundColor = percent >= 60 ? 'var(--hot)' : percent >= 25 ? 'var(--warm)' : 'var(--cold)';
+  let status = 'Waiting for heater data';
+  if (data.error) status = 'Cannot reach the heater relay';
+  else if (!valid && Number.isFinite(data.age_s)) status = 'Heater data is stale';
+  else if (valid) status = data.age_s < 60 ? 'Updated less than a minute ago' : `Updated ${Math.floor(data.age_s / 60)} min ago`;
+  if (data.fault) status = `Fault ${data.fault}. ${status}`;
+  set('status', status);
+  get('status').classList.toggle('error', Boolean(data.error || data.fault));
+  renderReadiness();
+}
+
+function renderReadiness() {
+  const valid = reading?.reading_fresh && Number.isFinite(reading.available_gallons);
+  const target = insights?.reference ?? 16;
+  const rate = reading?.recovery?.gallons_per_hour;
+  let label = missing;
+  let note = 'Waiting for fresh tank and recovery readings';
+  if (valid && reading.recent_flow) {
+    note = 'Recovery estimate available after demand eases';
+  } else if (valid && reading.recovery) {
+    const shortfall = Math.max(0, target - reading.available_gallons);
+    if (shortfall === 0) label = 'Ready';
+    else if (rate > 0 && reading.recovery.minutes > 0 && shortfall * 60 / rate <= reading.recovery.minutes + 1) {
+      label = minutes(Math.ceil(shortfall * 60 / rate));
+    }
+    const reference = insights?.learned_reference ? 'typical lighter draw' : 'planning reference';
+    note = `${target} gal at 105 °F (${reference})`;
+    if (shortfall > 0 && label === missing) note = 'Reference reserve may exceed what this cycle can restore';
+  }
+  set('next-shower', label);
+  set('next-note', note);
+}
+
+function renderChart() {
+  if (!chartData || !chartData.points.length) return;
+  const chart = get('chart');
+  const rect = chart.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  chart.width = Math.round(rect.width * scale);
+  chart.height = Math.round(rect.height * scale);
+  const ctx = chart.getContext('2d');
+  if (!ctx || !chart.width) return;
+  ctx.scale(scale, scale);
+  const css = getComputedStyle(chart);
+  const {start, end, points} = chartData;
+  const left = 40, right = rect.width - 8, top = 10, bottom = rect.height - 24;
+  const x = stamp => left + (stamp - start) / (end - start) * (right - left);
+  const y = value => bottom - value / 100 * (bottom - top);
+  ctx.font = '11px system-ui';
+  ctx.fillStyle = css.getPropertyValue('--muted');
+  ctx.strokeStyle = css.getPropertyValue('--line');
+  ctx.beginPath();
+  for (const tick of [0, 50, 100]) {
+    ctx.fillText(`${tick}%`, 1, y(tick) + 4);
+    ctx.moveTo(left, y(tick));
+    ctx.lineTo(right, y(tick));
+  }
+  ctx.stroke();
+  ctx.textAlign = 'left';
+  ctx.fillText('24 hours ago', left, rect.height - 5);
+  ctx.textAlign = 'right';
+  ctx.fillText('Now', right, rect.height - 5);
+  const ink = css.getPropertyValue('--cold');
+  ctx.strokeStyle = ink;
+  ctx.fillStyle = ink;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let previous = null;
+  for (const [stamp, value] of points) {
+    if (previous === null || stamp - previous > 600) {
+      ctx.fillRect(x(stamp) - 1, y(value) - 1, 3, 3);
+      ctx.moveTo(x(stamp), y(value));
+    } else {
+      ctx.lineTo(x(stamp), y(value));
+    }
+    previous = stamp;
+  }
+  ctx.stroke();
+}
+
+const dateLabel = new Intl.DateTimeFormat('en-US', {weekday:'short', month:'short', day:'numeric', timeZone:'UTC'});
+const clockLabel = new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:'America/Chicago'});
+
+function renderInsights(data) {
+  insights = data;
+  renderReadiness();
+  const replay = get('replay');
+  replay.replaceChildren();
+  if (!data.replay.length) set('replay', 'Waiting for daily readings.');
+  for (const day of data.replay) {
+    const title = document.createElement('p');
+    title.textContent = `${dateLabel.format(new Date(day.date))}, ${day.low} gal low${day.covered ? '' : ' (partial coverage)'}`;
+    replay.append(title);
+    if (!day.draws.length) continue;
+    const list = document.createElement('ul');
+    list.className = 'replay';
+    for (const draw of day.draws) {
+      const row = document.createElement('li');
+      const start = clockLabel.format(draw.start * 1000);
+      const recovered = draw.recovered ? `pre-draw reserve restored at ${clockLabel.format(draw.recovered * 1000)}` : 'recovery unobserved';
+      row.textContent = `${start}, low ${draw.low} gal, ${recovered}${draw.complete ? '' : ' (partial draw)'}`;
+      list.append(row);
+    }
+    replay.append(list);
+  }
+  set('draw-groups', data.draw_groups.length ? data.draw_groups.map(group =>
+    `${group.name}: ${group.loss_per_minute} gal/min reserve loss (${group.count} draws)`).join('. ') : 'Waiting for six complete draws.');
+  const [previous, current] = data.recovery_trend;
+  const rate = week => week.gallons_per_hour === null ? 'still learning' :
+    `${week.gallons_per_hour} gal/hr (${week.count} intervals)`;
+  set('trend', `Last 7 days: ${rate(current)}. Previous 7 days: ${rate(previous)}.`);
+}
+
+function renderHistory(data) {
+  chartData = data;
+  const points = data.points;
+  get('chart').hidden = !points.length;
+  if (points.length) {
+    const low = Math.min(...points.map(point => point[1]));
+    const latest = points.at(-1)[1];
+    set('chart-note', `Lowest recorded charge ${low}%. Most recent chart interval ${latest}%.`);
+    renderChart();
+  } else {
+    set('chart-note', 'History will appear as the heater reports.');
+  }
+  const rows = data.days.map(day => {
+    const row = document.createElement('tr');
+    const dateCell = document.createElement('th');
+    dateCell.scope = 'row';
+    dateCell.textContent = dateLabel.format(new Date(day.date));
+    row.append(dateCell);
+    const kwh = day.observed_kwh === null ? missing : day.observed_kwh.toFixed(2);
+    for (const text of [numeral(day.low_pct, '%'), kwh]) {
+      row.insertCell().textContent = text;
+    }
+    return row;
+  });
+  get('daily-stats').replaceChildren(...rows);
+}
+
+async function load(path, display, onError, interval) {
+  try {
+    const response = await fetch(path, {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    display(await response.json());
+  } catch {
+    onError();
+  } finally {
+    window.setTimeout(() => load(path, display, onError, interval), interval);
+  }
+}
+
+load('api', renderReading, () => renderReading({error:true}), 15000);
+load('api/insights', renderInsights, () => {
+  insights = null;
+  renderReadiness();
+  for (const id of ['replay', 'draw-groups', 'trend']) set(id, 'Insights are temporarily unavailable.');
+}, 60000);
+load('api/history', renderHistory, () => {
+  chartData = null;
+  get('chart').hidden = true;
+  set('chart-note', 'History is temporarily unavailable.');
+  const row = document.createElement('tr');
+  row.insertCell().colSpan = 3;
+  row.cells[0].textContent = 'History is temporarily unavailable.';
+  get('daily-stats').replaceChildren(row);
+}, 60000);
+window.addEventListener('resize', renderChart);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderChart);
+</script>
+</body>
+</html>
